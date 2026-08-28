@@ -197,13 +197,11 @@ class WeatherShield(gl.Contract):
 	@gl.public.write
 	def withdraw(self) -> None:
 		who = gl.message.sender_address
-		if not isinstance(who, Address):
-			who = Address(who)
 		amount = self.credits.get(who, u256(0))
 		if amount == u256(0):
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Nothing to withdraw")
 		self.credits[who] = u256(0)
-		_Recipient(Address(str(who))).emit_transfer(value=u256(amount))
+		_Recipient(who).emit_transfer(value=u256(amount))
 
 	@gl.public.view
 	def get_policy(self, policy_id: str) -> dict:
