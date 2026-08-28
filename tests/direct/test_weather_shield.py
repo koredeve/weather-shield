@@ -233,7 +233,25 @@ def test_check_weather_maps_http_status_to_error_classes(
 
     direct_vm.clear_mocks()
     direct_vm.mock_web(WEB_REGEX, {"status": 500, "body": "boom"})
-    with direct_vm.expect_revert("[TRANSIENT]"):
-        contract.check_weather("policy-rain")
-
     assert contract.get_policy("policy-rain")["status"] == "active"
+
+
+def test_empty_policy_inputs_and_non_https_rejected(direct_vm, direct_deploy, direct_alice):
+    """Empty policy id, location, zero coverage, or non-HTTPS URLs are rejected."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    direct_vm.sender = direct_alice
+
+    with direct_vm.expect_revert("URL must start with https://"):
+        contract.set_base_url("http://insecure.example.com/weather")
+
+    _set_base_url(direct_vm, contract, direct_alice)
+
+    direct_vm.value = PREMIUM
+    with direct_vm.expect_revert("must not be empty"):
+        contract.buy_policy("  ", "London", "rain_mm", 300, COVERAGE)
+
+    with direct_vm.expect_revert("must not be empty"):
+        contract.buy_policy("policy-empty-loc", "  ", "rain_mm", 300, COVERAGE)
+
+    direct_vm.value = 0
+

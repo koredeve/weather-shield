@@ -90,9 +90,10 @@ class WeatherShield(gl.Contract):
 	def set_base_url(self, url: str) -> None:
 		if gl.message.sender_address != self.owner_addr:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Only owner")
-		if len(str(url)) == 0:
-			raise gl.vm.UserError(f"{ERROR_EXPECTED} URL must not be empty")
-		self.base_url = str(url)
+		clean_url = str(url).strip()
+		if not clean_url.startswith("https://"):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} URL must start with https://")
+		self.base_url = clean_url
 
 	@gl.public.write.payable
 	def buy_policy(
@@ -105,14 +106,20 @@ class WeatherShield(gl.Contract):
 	) -> None:
 		if peril not in UPWARD_PERILS and peril != PERIL_TEMP_LOW:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Unsupported peril")
+		if u256(coverage_atto) == u256(0):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Coverage must be greater than zero")
+		clean_id = str(policy_id).strip()
+		clean_loc = str(location).strip()
+		if not clean_id or not clean_loc:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy id and location must not be empty")
 		expected_premium = u256(int(coverage_atto) // 10)
 		if gl.message.value != expected_premium:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Premium mismatch, send coverage/10")
-		if policy_id in self.policies:
+		if clean_id in self.policies:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy id already exists")
-		self.policies[policy_id] = Policy(
+		self.policies[clean_id] = Policy(
 			holder=gl.message.sender_address,
-			location=str(location),
+			location=clean_loc,
 			peril=str(peril),
 			threshold_x10=u256(threshold_x10),
 			coverage_atto=u256(coverage_atto),
@@ -120,7 +127,7 @@ class WeatherShield(gl.Contract):
 			status=STATUS_ACTIVE,
 			last_value_x10=i64(0),
 		)
-		self.policy_ids.append(policy_id)
+		self.policy_ids.append(clean_id)
 
 	@gl.public.write
 	def check_weather(self, policy_id: str) -> None:
@@ -128,6 +135,8 @@ class WeatherShield(gl.Contract):
 		if policy.status != STATUS_ACTIVE:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy is not active")
 		url_base = str(self.base_url)
+		if not url_base:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Base URL not configured")
 		location = str(policy.location)
 		peril = str(policy.peril)
 		threshold = int(policy.threshold_x10)
