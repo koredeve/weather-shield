@@ -3,6 +3,7 @@
 from genlayer import *
 from dataclasses import dataclass
 import json
+import time
 
 
 ERROR_EXPECTED = "[EXPECTED]"
@@ -59,11 +60,17 @@ class Policy:
 	premium_atto: u256
 	status: str
 	last_value_x10: i64
+	endpoint: str
+	check_after: u256
+	check_before: u256
 
 
 class WeatherShield(gl.Contract):
 	owner_addr: Address
 	base_url: str
+	insurance_pool: u256
+	reserve_fund: u256
+	exposure: u256
 	policies: TreeMap[str, Policy]
 	credits: TreeMap[Address, u256]
 	policy_ids: DynArray[str]
@@ -71,6 +78,9 @@ class WeatherShield(gl.Contract):
 	def __init__(self) -> None:
 		self.owner_addr = gl.message.sender_address
 		self.base_url = ""
+		self.insurance_pool = u256(0)
+		self.reserve_fund = u256(0)
+		self.exposure = u256(0)
 
 	def _get_policy(self, policy_id: str) -> Policy:
 		policy = self.policies.get(policy_id)
@@ -96,6 +106,20 @@ class WeatherShield(gl.Contract):
 		self.base_url = clean_url
 
 	@gl.public.write.payable
+	def fund_reserve(self) -> None:
+		if gl.message.value == u256(0):
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Send value with the call")
+		self.reserve_fund = self.reserve_fund + gl.message.value
+
+	@gl.public.view
+	def get_reserves(self) -> dict:
+		return {
+			"insurance_pool": self.insurance_pool,
+			"reserve_fund": self.reserve_fund,
+			"exposure": self.exposure,
+		}
+
+	@gl.public.write.payable
 	def buy_policy(
 		self,
 		policy_id: str,
@@ -103,6 +127,8 @@ class WeatherShield(gl.Contract):
 		peril: str,
 		threshold_x10: u256,
 		coverage_atto: u256,
+		check_after_timestamp: u256 = u256(0),
+		check_before_timestamp: u256 = u256(0),
 	) -> None:
 		if peril not in UPWARD_PERILS and peril != PERIL_TEMP_LOW:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Unsupported peril")
@@ -115,8 +141,25 @@ class WeatherShield(gl.Contract):
 		expected_premium = u256(int(coverage_atto) // 10)
 		if gl.message.value != expected_premium:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Premium mismatch, send coverage/10")
+		url_base = str(self.base_url).strip()
+		if not url_base:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Base URL not configured")
 		if clean_id in self.policies:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy id already exists")
+
+		# Solvency Invariant: total exposure cannot exceed backed funds (pool + reserve)
+		if self.insurance_pool + self.reserve_fund < self.exposure + coverage_atto:
+			raise gl.vm.UserError(
+				f"{ERROR_EXPECTED} Insufficient insurer reserve to guarantee coverage solvency"
+			)
+
+		self.insurance_pool = self.insurance_pool + expected_premium
+		self.exposure = self.exposure + coverage_atto
+
+		check_after = check_after_timestamp
+		if check_after == u256(0):
+			check_after = u256(int(time.time()))
+
 		self.policies[clean_id] = Policy(
 			holder=gl.message.sender_address,
 			location=clean_loc,
@@ -126,6 +169,9 @@ class WeatherShield(gl.Contract):
 			premium_atto=u256(gl.message.value),
 			status=STATUS_ACTIVE,
 			last_value_x10=i64(0),
+			endpoint=url_base,
+			check_after=check_after,
+			check_before=check_before_timestamp,
 		)
 		self.policy_ids.append(clean_id)
 
@@ -134,9 +180,17 @@ class WeatherShield(gl.Contract):
 		policy = self._get_policy(policy_id)
 		if policy.status != STATUS_ACTIVE:
 			raise gl.vm.UserError(f"{ERROR_EXPECTED} Policy is not active")
-		url_base = str(self.base_url)
-		if not url_base:
-			raise gl.vm.UserError(f"{ERROR_EXPECTED} Base URL not configured")
+
+		now = u256(int(time.time()))
+		if now < policy.check_after:
+			raise gl.vm.UserError(
+				f"{ERROR_EXPECTED} Premature check: coverage window has not started yet"
+			)
+		if policy.check_before != u256(0) and now > policy.check_before:
+			raise gl.vm.UserError(f"{ERROR_EXPECTED} Check window has expired")
+
+		# Invariant: Immutable endpoint permanently bound at purchase time
+		url_base = str(policy.endpoint)
 		location = str(policy.location)
 		peril = str(policy.peril)
 		threshold = int(policy.threshold_x10)
@@ -165,15 +219,36 @@ class WeatherShield(gl.Contract):
 				triggered = value_x10 >= threshold
 			else:
 				triggered = value_x10 <= threshold
-			return {"triggered": bool(triggered), "value_x10": int(value_x10)}
+			return {
+				"triggered": bool(triggered),
+				"value_x10": int(value_x10),
+				"location": location,
+				"peril": peril,
+				"status": "FINAL",
+			}
 
 		def validator_fn(leaders_res: gl.vm.Result) -> bool:
 			if not isinstance(leaders_res, gl.vm.Return):
 				return _handle_leader_error(leaders_res, leader_fn)
 			leader_data = leaders_res.calldata
-			fresh = leader_fn()
 			if not isinstance(leader_data, dict):
 				return False
+			# Invariant: Complete typed schema validation
+			for req_field in ("triggered", "value_x10", "location", "peril", "status"):
+				if req_field not in leader_data:
+					return False
+			if not isinstance(leader_data["triggered"], bool):
+				return False
+			if not isinstance(leader_data["value_x10"], int):
+				return False
+			if not isinstance(leader_data["location"], str) or not leader_data["location"]:
+				return False
+			if not isinstance(leader_data["peril"], str) or not leader_data["peril"]:
+				return False
+			if leader_data["status"] != "FINAL":
+				return False
+
+			fresh = leader_fn()
 			leader_triggered = bool(leader_data.get("triggered", False))
 			fresh_triggered = bool(fresh.get("triggered", False))
 			if leader_triggered != fresh_triggered:
@@ -185,12 +260,17 @@ class WeatherShield(gl.Contract):
 		result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
 		policy.last_value_x10 = i64(int(result["value_x10"]))
+		self.exposure = self.exposure - policy.coverage_atto
 		if bool(result["triggered"]):
 			policy.status = STATUS_PAID
 			holder = policy.holder
-			self.credits[holder] = self.credits.get(holder, u256(0)) + u256(
-				policy.coverage_atto
-			)
+			if self.insurance_pool >= policy.coverage_atto:
+				self.insurance_pool = self.insurance_pool - policy.coverage_atto
+			else:
+				remainder = policy.coverage_atto - self.insurance_pool
+				self.insurance_pool = u256(0)
+				self.reserve_fund = self.reserve_fund - remainder
+			self.credits[holder] = self.credits.get(holder, u256(0)) + policy.coverage_atto
 		else:
 			policy.status = STATUS_DENIED
 
@@ -215,6 +295,9 @@ class WeatherShield(gl.Contract):
 			"premium_atto": policy.premium_atto,
 			"status": policy.status,
 			"last_value_x10": policy.last_value_x10,
+			"endpoint": policy.endpoint,
+			"check_after": policy.check_after,
+			"check_before": policy.check_before,
 		}
 
 	@gl.public.view

@@ -10,7 +10,11 @@ WEB_REGEX = r"https://api\.example\.com/weather"
 def _deploy(direct_vm, direct_deploy, owner):
     """Deploys with `owner` as the sender so the deployer becomes the contract owner."""
     direct_vm.sender = owner
-    return direct_deploy("contracts/WeatherShield.py")
+    contract = direct_deploy("contracts/WeatherShield.py")
+    direct_vm.value = 500 * 10**18
+    contract.fund_reserve()
+    direct_vm.value = 0
+    return contract
 
 
 def _set_base_url(direct_vm, contract, who):
@@ -254,4 +258,88 @@ def test_empty_policy_inputs_and_non_https_rejected(direct_vm, direct_deploy, di
         contract.buy_policy("policy-empty-loc", "  ", "rain_mm", 300, COVERAGE)
 
     direct_vm.value = 0
+
+
+def test_payout_solvency_enforcement(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """Buying coverage that exceeds the insurer's reserve pool reverts with an insolvency error."""
+    direct_vm.sender = direct_alice
+    contract = direct_deploy("contracts/WeatherShield.py")
+    # Deploy without funding reserve pool
+    _set_base_url(direct_vm, contract, direct_alice)
+
+    # Attempt to buy 10 GEN coverage with only 1 GEN premium (9 GEN unbacked)
+    direct_vm.sender = direct_bob
+    direct_vm.value = PREMIUM
+    with direct_vm.expect_revert("Insufficient insurer reserve to guarantee coverage solvency"):
+        contract.buy_policy("policy-unbacked", "London", "rain_mm", 300, COVERAGE)
+    direct_vm.value = 0
+
+
+def test_premature_checks_rejected(direct_vm, direct_deploy, direct_alice):
+    """Checking weather before the policy coverage window starts reverts."""
+    from unittest.mock import patch
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _set_base_url(direct_vm, contract, direct_alice)
+
+    now = 1700000000.0
+    future_start = int(now) + 86400  # Starts tomorrow
+
+    with patch("time.time", return_value=now):
+        direct_vm.sender = direct_alice
+        direct_vm.value = PREMIUM
+        contract.buy_policy("policy-window", "London", "rain_mm", 300, COVERAGE, future_start, 0)
+        direct_vm.value = 0
+
+        # Immediate check before coverage window begins
+        with direct_vm.expect_revert("Premature check: coverage window has not started yet"):
+            contract.check_weather("policy-window")
+
+    # Time advances into the coverage window
+    with patch("time.time", return_value=now + 86401):
+        direct_vm.mock_web(WEB_REGEX, {"status": 200, "body": json.dumps({"value": 35.0})})
+        contract.check_weather("policy-window")
+        assert contract.get_policy("policy-window")["status"] == "paid"
+
+
+def test_endpoint_changes_do_not_alter_purchased_policy(
+    direct_vm, direct_deploy, direct_alice
+):
+    """Changing base_url after a policy is purchased does NOT affect the policy's bound endpoint."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _set_base_url(direct_vm, contract, direct_alice)
+
+    _buy_policy(direct_vm, contract, direct_alice, "policy-bound")
+    policy = contract.get_policy("policy-bound")
+    assert policy["endpoint"] == BASE_URL
+
+    # Owner changes base_url
+    direct_vm.sender = direct_alice
+    contract.set_base_url("https://new-api.example.com/weather")
+    assert contract.get_base_url() == "https://new-api.example.com/weather"
+
+    # Policy remains bound to original BASE_URL
+    assert contract.get_policy("policy-bound")["endpoint"] == BASE_URL
+
+    # Web mock for original BASE_URL resolves the policy
+    direct_vm.mock_web(WEB_REGEX, {"status": 200, "body": json.dumps({"value": 35.0})})
+    contract.check_weather("policy-bound")
+    assert contract.get_policy("policy-bound")["status"] == "paid"
+
+
+def test_missing_result_fields_rejected(direct_vm, direct_deploy, direct_alice):
+    """Missing value field in weather API payload reverts and leaves policy active."""
+    contract = _deploy(direct_vm, direct_deploy, direct_alice)
+    _set_base_url(direct_vm, contract, direct_alice)
+    _buy_policy(direct_vm, contract, direct_alice, "policy-missing")
+
+    # Payload with station but missing value
+    direct_vm.mock_web(
+        WEB_REGEX, {"status": 200, "body": json.dumps({"station": "EGLC", "status": "OK"})}
+    )
+
+    with direct_vm.expect_revert("[EXTERNAL]"):
+        contract.check_weather("policy-missing")
+
+    assert contract.get_policy("policy-missing")["status"] == "active"
+
 

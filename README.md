@@ -46,16 +46,25 @@ pytest tests/direct/ -v
 | Method | Type | Notes |
 | --- | --- | --- |
 | `owner()` | view | Deployer address |
-| `get_base_url()` | view | Configured weather API endpoint |
-| `get_policy(policy_id)` | view | Full policy record (`holder` as string, `last_value_x10` may be negative for temperatures) |
+| `get_base_url()` | view | Configured weather API endpoint baseline |
+| `get_reserves()` | view | Returns `{insurance_pool, reserve_fund, exposure}` for solvency auditing |
+| `fund_reserve()` | write, payable | Capitalizes the insurer's reserve fund to back coverage liabilities |
+| `set_base_url(url)` | write | Owner-only, sets the weather API base URL for future policies |
+| `buy_policy(policy_id, location, peril, threshold_x10, coverage_atto, check_after, check_before)` | write, payable | Enforces solvency invariant, binds immutable endpoint and coverage check window |
+| `check_weather(policy_id)` | write | Active policies only; enforces coverage window; uses bound endpoint; validates typed schema; resolves to `paid`/`denied` |
+| `withdraw()` | write | Transfers caller's credit out, zeroes the record |
+| `get_policy(policy_id)` | view | Full policy record including endpoint, check_after, check_before |
 | `credit_of(who)` | view | Withdrawable credit for an address |
 | `total_policies()` | view | Number of policies ever created |
-| `set_base_url(url)` | write | Owner-only, sets the weather API base URL |
-| `buy_policy(policy_id, location, peril, threshold_x10, coverage_atto)` | write, payable | `peril` in `rain_mm`/`wind_kmh`/`snow_cm`/`temp_low_c`; must attach exactly `coverage_atto // 10`; unique id |
-| `check_weather(policy_id)` | write | Anyone; active policies only; resolves to `paid`/`denied` |
-| `withdraw()` | write | Transfers caller's credit out, zeroes the record |
+
+## Deployment
+
+- **Network**: StudioNet (GenLayer)
+- **Contract Address**: `0x669B7e5C14AE3fD4Ce269055836B11aCf3425b5E`
+- **Explorer**: [https://explorer-studio.genlayer.com/address/0x669B7e5C14AE3fD4Ce269055836B11aCf3425b5E](https://explorer-studio.genlayer.com/address/0x669B7e5C14AE3fD4Ce269055836B11aCf3425b5E)
 
 ## StudioNet
 
 Deploy and try it on StudioNet: gasless transactions, 0 GEN needed — just select `studionet` in
 the config (`gltest.config.yaml` already defaults to it).
+
